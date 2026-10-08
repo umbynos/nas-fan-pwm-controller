@@ -1,17 +1,24 @@
 #include "SevSeg.h"
 SevSeg sevseg; //Instantiate a seven segment controller object
-int pwmPin  = 3; // digital PWM pin 9
-unsigned long time;
-unsigned int rpm;
-String stringRPM;
-int thermistorPin = 0;
-int tachPin = 12;
-int vo;
-float logR2, r2, t, r1 = 10000, c1 = 1.009249522e-03, c2 = 2.378405444e-04, c3 = 2.019202697e-07;
-int diskTemperature;
-unsigned int minTemp = 25, maxTemp = 45, minSpeed = 0, maxSpeed = 80;
-int speed;
 
+const byte pwmPin = 3;        // OC2B, driven by Timer2 at 25kHz
+const byte thermistorPin = A0;
+const byte tachPin = 12;
+
+// Steinhart-Hart coefficients for the NTC, r1 is the fixed resistor of the divider
+const float r1 = 10000, c1 = 1.009249522e-03, c2 = 2.378405444e-04, c3 = 2.019202697e-07;
+
+const int minTemp = 25, maxTemp = 45;
+const byte pwmTop = 79;                    // Timer2 TOP: 16MHz / 8 / (79 + 1) = 25kHz
+const byte minSpeed = 0, maxSpeed = pwmTop; // duty cycle range (0-79)
+
+const unsigned long sampleInterval = 20;   // ms between ADC samples
+const unsigned long updateInterval = 1000; // ms between temperature/fan/display updates
+const float displayHysteresis = 0.7;       // °C the reading must move before the display changes
+
+long adcFiltered = -1;   // exponential moving average of the ADC, scaled by 16
+unsigned long lastSample, lastUpdate;
+int shownTemperature = -100;
 
 void setup() {
   //LCD init
@@ -31,55 +38,88 @@ void setup() {
   pinMode(pwmPin, OUTPUT);   // OCR2B sets duty cycle
   // Set up Fast PWM on Pin 3
   TCCR2A = 0x23;     // COM2B1, WGM21, WGM20
-  // Set prescaler 
-  TCCR2B = 0x0A;   // WGM21, Prescaler = /8
-  // Set TOP and initialize duty cycle to zero(0)
-  OCR2A = 79;    // TOP DO NOT CHANGE, SETS PWM PULSE RATE
-  OCR2B = 0;    // duty cycle for Pin 6 (0-79) generates 1 500nS pulse even when 0 :
-  digitalWrite(tachPin, HIGH);   // Starts reading fan speed
+  // Set prescaler
+  TCCR2B = 0x0A;   // WGM22, Prescaler = /8
+  // Set TOP and initialize duty cycle
+  OCR2A = pwmTop;    // TOP DO NOT CHANGE, SETS PWM PULSE RATE
+  OCR2B = maxSpeed;  // start at full speed until the first reading is available
+
+  pinMode(tachPin, INPUT_PULLUP);
 
   //Serial.begin(9600);
-  }
+}
 
 void loop() {
-  diskTemperature = getTemp();
-  sevseg.setNumber(diskTemperature);
-  if (diskTemperature < minTemp) {
+  // Keep the multiplexing as regular as possible: only cheap work runs here
+  sevseg.refreshDisplay();
+
+  unsigned long now = millis();
+
+  if (now - lastSample >= sampleInterval) {
+    lastSample = now;
+    sampleTemp();
+  }
+
+  if (now - lastUpdate >= updateInterval) {
+    lastUpdate = now;
+    update();
+  }
+}
+
+// Single ADC read (~110us) fed into an integer EMA, cheap enough to not disturb the display
+void sampleTemp() {
+  long raw = (long)analogRead(thermistorPin) << 4;
+  if (adcFiltered < 0) {
+    adcFiltered = raw;
+  } else {
+    adcFiltered += (raw - adcFiltered) / 16;
+  }
+}
+
+void update() {
+  float temperature = getTemp();
+
+  // Sensor disconnected or shorted: show "--" and run the fan at full speed
+  if (isnan(temperature) || temperature < -20 || temperature > 99) {
+    sevseg.setChars("--");
+    shownTemperature = -100;
+    setFanSpeed(maxSpeed);
+    return;
+  }
+
+  // Change the shown value only when the reading clearly moved, so it doesn't bounce between two digits
+  if (abs(temperature - shownTemperature) >= displayHysteresis) {
+    shownTemperature = round(temperature);
+    sevseg.setNumber(shownTemperature);
+  }
+
+  int speed;
+  if (shownTemperature <= minTemp) {
     speed = minSpeed;
-  } else if (diskTemperature > maxTemp) {
+  } else if (shownTemperature >= maxTemp) {
     speed = maxSpeed;
   } else {
-    speed = map(diskTemperature, minTemp, maxTemp, minSpeed, maxSpeed);
+    speed = map(shownTemperature, minTemp, maxTemp, minSpeed, maxSpeed);
   }
   //Serial.println(speed);
   setFanSpeed(speed);
-  sevseg.refreshDisplay(); // Must run repeatedly
-}
-
-int getRPMS() {
-  time = pulseIn(tachPin, HIGH);
-  rpm = (1000000 * 60) / (time * 4);
-  stringRPM = String(rpm);
-  if (stringRPM.length() < 5) {
-    Serial.print("Fan Speed: ");
-    Serial.print(rpm, DEC);
-    Serial.println("rpm");
-  }
-  return rpm;
 }
 
 float getTemp() {
-  vo = analogRead(thermistorPin);
-  r2 = r1 * (1023.0 / (float)vo - 1.0);
-  logR2 = log(r2);
-  t = (1.0 / (c1 + c2*logR2 + c3*logR2*logR2*logR2));
+  float vo = adcFiltered / 16.0;
+  if (vo < 1 || vo > 1022) {
+    return NAN;
+  }
+  float r2 = r1 * (1023.0 / vo - 1.0);
+  float logR2 = log(r2);
+  float t = (1.0 / (c1 + c2*logR2 + c3*logR2*logR2*logR2));
   t = t - 273.15;
-  //Serial.print("Temperature: "); 
+  //Serial.print("Temperature: ");
   //Serial.print(t);
   //Serial.println(" C");
   return t;
 }
 
-void setFanSpeed(unsigned int speed){
-  OCR2B = speed;    // set duty cycle (0 to 80)
+void setFanSpeed(byte speed) {
+  OCR2B = speed;    // set duty cycle (0 to pwmTop)
 }
